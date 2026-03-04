@@ -112,6 +112,13 @@ if not set(Libs).issubset(set(sys.modules.keys())):
         get_qnode,modify_figure,parallel_jobs,fig_IFNO,ceqstate,subdomain_index,interp,
         nargout,pause,isnumber,ncfile,urlsave,add_var,compute_dem_contour)
 
+   import src.postproc_common as postproc_common
+   sys.modules['postproc_common'] = postproc_common
+   from postproc_common import (
+        deep_update_dict,init_mpi_runtime,rank_log,report_work_assignment,
+        compute_skill_metrics,write_csv_rows,read_csv_rows,
+        write_rank_csv_chunk,collect_rank_csv_chunks,cleanup_rank_csv_chunks)
+
    if os.path.exists(os.path.dirname(__file__)+'/pylibs/src'):
       import pylibs.src.schism_file as schism_file
    else:
