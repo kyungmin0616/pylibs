@@ -8,7 +8,9 @@ from __future__ import annotations
 import copy
 import csv
 import os
+import re
 import sys
+from glob import glob
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -301,3 +303,358 @@ def cleanup_rank_csv_chunks(chunk_dir: PathLike, prefix: str = "chunk") -> None:
         cdir.rmdir()
     except Exception:
         pass
+
+
+def to_scalar(value: Any, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if len(value) == 0:
+            return default
+        return value[0]
+    return value
+
+
+def normalize_stack_list(stacks: Any, discovered_stacks: Any) -> np.ndarray:
+    if stacks is None:
+        return np.asarray(
+            sorted({int(v) for v in np.asarray(discovered_stacks).ravel()}),
+            dtype=int,
+        )
+    if isinstance(stacks, (list, tuple)) and len(stacks) == 2:
+        s0 = int(stacks[0])
+        s1 = int(stacks[1])
+        if s1 < s0:
+            raise ValueError(f"Invalid stack range [{s0}, {s1}]")
+        return np.arange(s0, s1 + 1, dtype=int)
+    return np.asarray(
+        sorted({int(v) for v in np.asarray(stacks).ravel()}),
+        dtype=int,
+    )
+
+
+def primary_stack_file(outputs_dir: PathLike, stack: int, outfmt: int) -> Optional[str]:
+    outputs = str(outputs_dir)
+    st = int(stack)
+    if int(outfmt) == 0:
+        fn = os.path.join(outputs, f"out2d_{st}.nc")
+        return fn if os.path.exists(fn) else None
+
+    cand = sorted(glob(os.path.join(outputs, f"schout_*_{st}.nc")))
+    if len(cand) > 0:
+        return cand[0]
+    fn = os.path.join(outputs, f"schout_{st}.nc")
+    return fn if os.path.exists(fn) else None
+
+
+def stack_files_for_check(
+    outputs_dir: PathLike,
+    stack: int,
+    outfmt: int,
+    check_all_files: bool = False,
+) -> List[str]:
+    primary = primary_stack_file(outputs_dir, stack, outfmt)
+    if primary is None:
+        return []
+    if not bool(check_all_files):
+        return [primary]
+    files = sorted(glob(os.path.join(str(outputs_dir), f"*_{int(stack)}.nc")))
+    if len(files) == 0:
+        return [primary]
+    if primary not in files:
+        files.insert(0, primary)
+    return files
+
+
+def header_time_ok(
+    nc_path: PathLike,
+    readnc: Optional[Callable[[str], Any]] = None,
+) -> Tuple[bool, str]:
+    handle = None
+    try:
+        if readnc is None:
+            from netCDF4 import Dataset  # type: ignore
+
+            handle = Dataset(str(nc_path), mode="r")
+        else:
+            handle = readnc(str(nc_path))
+        variables = getattr(handle, "variables", {})
+        if "time" not in variables:
+            return False, "missing time variable"
+        tvar = variables["time"]
+        if hasattr(tvar, "shape") and len(tvar.shape) > 0:
+            nt = int(tvar.shape[0])
+        else:
+            nt = int(len(np.asarray(tvar)))
+        if nt <= 0:
+            return False, "empty time variable"
+        _ = float(np.asarray(tvar[0]).ravel()[0])
+        return True, "ok"
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
+def size_ok(
+    path: PathLike,
+    ref_size: float,
+    ratio_min: float = 0.70,
+    abs_min_bytes: Optional[int] = None,
+) -> Tuple[bool, str]:
+    try:
+        size = int(os.path.getsize(str(path)))
+    except Exception as exc:
+        return False, f"size check failed: {exc}"
+    if abs_min_bytes is not None and size < int(abs_min_bytes):
+        return False, f"size={size} < abs_min={int(abs_min_bytes)}"
+    thr = float(ratio_min) * float(ref_size)
+    if size < thr:
+        return False, f"size={size} < ratio_min*median={int(thr)}"
+    return True, "ok"
+
+
+def screen_stacks(
+    outputs_dir: PathLike,
+    stacks: Any,
+    outfmt: int,
+    mode: Optional[str] = "light",
+    check_all_files: bool = False,
+    ratio_min: float = 0.70,
+    abs_min_bytes: Optional[int] = None,
+    readnc: Optional[Callable[[str], Any]] = None,
+    logger: Optional[Callable[[str], None]] = None,
+    log_limit: int = 20,
+) -> Tuple[np.ndarray, Dict[int, str]]:
+    stack_vals = [int(v) for v in np.asarray(stacks).ravel()]
+    if len(stack_vals) == 0:
+        return np.asarray([], dtype=int), {}
+
+    mode_norm = "none" if mode is None else str(mode).lower()
+    if mode_norm == "none":
+        return np.asarray(stack_vals, dtype=int), {}
+
+    primary: Dict[int, str] = {}
+    for st in stack_vals:
+        pth = primary_stack_file(outputs_dir, st, outfmt)
+        if pth is not None:
+            primary[st] = pth
+
+    ref_size: Optional[int] = None
+    sizes = [os.path.getsize(pth) for pth in primary.values() if os.path.exists(pth)]
+    if len(sizes) > 0:
+        ref_size = int(np.median(np.asarray(sizes, dtype=float)))
+
+    valid: List[int] = []
+    skipped: Dict[int, str] = {}
+    for st in stack_vals:
+        files = stack_files_for_check(outputs_dir, st, outfmt, check_all_files=check_all_files)
+        if len(files) == 0:
+            skipped[st] = "missing primary stack file"
+            continue
+
+        need_light = mode_norm in {"light", "light+size"}
+        need_size = mode_norm in {"size", "light+size"}
+        ok = True
+        reason = ""
+
+        if need_light:
+            for fn in files:
+                c_ok, c_reason = header_time_ok(fn, readnc=readnc)
+                if not c_ok:
+                    ok = False
+                    reason = f"{os.path.basename(fn)}: {c_reason}"
+                    break
+
+        if ok and need_size and ref_size is not None:
+            for fn in files:
+                s_ok, s_reason = size_ok(
+                    fn,
+                    ref_size=ref_size,
+                    ratio_min=ratio_min,
+                    abs_min_bytes=abs_min_bytes,
+                )
+                if not s_ok:
+                    ok = False
+                    reason = f"{os.path.basename(fn)}: {s_reason}"
+                    break
+
+        if ok:
+            valid.append(st)
+        else:
+            skipped[st] = reason
+
+    if logger is not None:
+        logger(
+            f"Stack screen ({mode_norm}): requested={len(stack_vals)}, "
+            f"valid={len(valid)}, skipped={len(skipped)}"
+        )
+        if len(skipped) > 0 and int(log_limit) > 0:
+            for i, st in enumerate(sorted(skipped.keys())):
+                if i >= int(log_limit):
+                    logger(f"  ... {len(skipped) - int(log_limit)} more skipped stacks")
+                    break
+                logger(f"  skip stack {st}: {skipped[st]}")
+
+    return np.asarray(valid, dtype=int), skipped
+
+
+def get_model_start_datenum(
+    run_dir: PathLike,
+    apply_utc_start: bool = False,
+    read_schism_param_func: Optional[Callable[[str, int], Dict[str, Any]]] = None,
+    datenum_func: Optional[Callable[[int, int, int], float]] = None,
+    param_name: str = "param.nml",
+) -> Tuple[Optional[float], str]:
+    pfile = os.path.join(str(run_dir), param_name)
+    if not os.path.exists(pfile):
+        return None, f"{param_name} not found in {run_dir}"
+
+    if read_schism_param_func is None or datenum_func is None:
+        try:
+            from pylib import read_schism_param as _read_schism_param, datenum as _datenum  # type: ignore
+
+            if read_schism_param_func is None:
+                read_schism_param_func = _read_schism_param
+            if datenum_func is None:
+                datenum_func = _datenum
+        except Exception as exc:
+            return None, f"missing read_schism_param/datenum functions: {exc}"
+
+    try:
+        params = read_schism_param_func(pfile, 1)
+    except Exception as exc:
+        return None, f"failed to parse {param_name}: {exc}"
+
+    req = ("start_year", "start_month", "start_day", "start_hour")
+    for key in req:
+        if key not in params:
+            return None, f"missing {key} in {param_name}"
+
+    try:
+        sy = int(to_scalar(params.get("start_year")))
+        sm = int(to_scalar(params.get("start_month")))
+        sd = int(to_scalar(params.get("start_day")))
+        sh = float(to_scalar(params.get("start_hour"), 0.0))
+        us = float(to_scalar(params.get("utc_start"), 0.0))
+    except Exception as exc:
+        return None, f"invalid start fields in {param_name}: {exc}"
+
+    d0 = float(datenum_func(sy, sm, sd))
+    d0 += sh / 24.0
+    if bool(apply_utc_start):
+        d0 -= us / 24.0
+    return d0, f"{sy:04d}-{sm:02d}-{sd:02d} {sh:05.2f}h (utc_start={us})"
+
+
+def read_stack_times_abs(
+    nc_path: PathLike,
+    start_datenum: Optional[float] = None,
+    readnc: Optional[Callable[[str], Any]] = None,
+    time_to_days: Optional[Callable[[Any], np.ndarray]] = None,
+) -> np.ndarray:
+    handle = None
+    try:
+        if readnc is None:
+            from netCDF4 import Dataset  # type: ignore
+
+            handle = Dataset(str(nc_path), mode="r")
+        else:
+            handle = readnc(str(nc_path))
+
+        tvar = getattr(handle, "variables", {}).get("time")
+        if tvar is None:
+            return np.asarray([], dtype=float)
+        if time_to_days is not None:
+            tvals = np.asarray(time_to_days(tvar), dtype=float).ravel()
+        else:
+            tvals = np.asarray(tvar[:], dtype=float).ravel()
+    except Exception:
+        return np.asarray([], dtype=float)
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+    if start_datenum is not None:
+        tvals = tvals + float(start_datenum)
+    return tvals
+
+
+def _first_value(item: Dict[str, Any], keys: Sequence[str]) -> Any:
+    for key in keys:
+        if key in item and item[key] is not None:
+            return item[key]
+    return None
+
+
+def normalize_run_specs(
+    cfg: Dict[str, Any],
+    runs_key: str = "RUNS",
+    run_keys: Sequence[str] = ("RUN", "run", "run_dir"),
+    name_keys: Sequence[str] = ("NAME", "name", "RUN_NAME", "run_name"),
+    output_keys: Sequence[str] = ("SNAME", "sname", "out_npz"),
+    output_template_key: str = "SNAME_TEMPLATE",
+    default_output_template: str = "./npz/{run_name}",
+    include_keys: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    include = list(include_keys) if include_keys is not None else []
+    runs = cfg.get(runs_key)
+    specs: List[Dict[str, Any]] = []
+
+    if runs is None:
+        run = _first_value(cfg, run_keys)
+        if run is None:
+            raise ValueError(f"Either {runs_key} or one of {list(run_keys)} must be configured.")
+
+        name = _first_value(cfg, name_keys)
+        if name is None:
+            name = os.path.basename(os.path.abspath(str(run)))
+        output = _first_value(cfg, output_keys)
+        if output is None:
+            tmpl = str(cfg.get(output_template_key, default_output_template))
+            output = tmpl.format(run_name=name, run=run)
+
+        spec: Dict[str, Any] = {"NAME": str(name), "RUN": str(run), "SNAME": str(output)}
+        for key in include:
+            spec[key] = cfg.get(key)
+        specs.append(spec)
+        return specs
+
+    for i, item in enumerate(runs):
+        if isinstance(item, str):
+            item = {run_keys[0]: item}
+        if not isinstance(item, dict):
+            raise ValueError(f"{runs_key}[{i}] must be dict or string")
+
+        run = _first_value(item, run_keys)
+        if run is None:
+            raise ValueError(f"{runs_key}[{i}] missing run key; expected one of {list(run_keys)}")
+
+        name = _first_value(item, name_keys)
+        if name is None:
+            name = os.path.basename(os.path.abspath(str(run)))
+
+        output = _first_value(item, output_keys)
+        if output is None:
+            tmpl = str(cfg.get(output_template_key, default_output_template))
+            output = tmpl.format(run_name=name, run=run)
+
+        spec = {"NAME": str(name), "RUN": str(run), "SNAME": str(output)}
+        for key in include:
+            spec[key] = item.get(key, cfg.get(key))
+        specs.append(spec)
+
+    return specs
+
+
+def stack_num_from_name(path: PathLike) -> Optional[int]:
+    name = os.path.basename(str(path))
+    match = re.search(r"_(\d+)\.nc$", name)
+    return int(match.group(1)) if match else None
